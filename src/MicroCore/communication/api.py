@@ -1,4 +1,5 @@
-from typing import Any, Dict
+from typing import Any, Dict, Union
+from enum import Enum
 
 from ..core import MicroCore
 from ..monitor import OpenTelemetryWrapper
@@ -78,18 +79,43 @@ def patch_fastapi(app: FastAPI) -> None:
         "({{REQUEST_PATH}}", '("." + {{REQUEST_PATH}}'
     )
 
-def create_api(micro_core: MicroCore) -> FastAPI:
+def create_endpoint_route(opentelemetry_wrapper, app: FastAPI, endpointname: str, micro_core) -> None:
+    @app.post(
+        f"/{endpointname}",
+        operation_id=endpointname,
+        response_model=micro_core.output_type,
+        status_code=status.HTTP_200_OK,
+    )
+    async def predict(input: micro_core.input_type) -> Any:  # type: ignore
+        tracer = opentelemetry_wrapper.tracer
+        predictions_counter = opentelemetry_wrapper.create_counter(name=f"{endpointname}_endpoint_counter", description="Count of predictions made")
+
+        with tracer.start_as_current_span(f"/{endpointname}") as predict_span:
+            predictions_counter.add(1)
+            """Executes this micro_core."""
+            return micro_core(input)
+
+
+def create_api(micro_core_or_dict: Union[MicroCore, Dict]) -> FastAPI:
+
+    class InputType(Enum):
+        MICROCORE = 1
+        MICROCORE_DICT = 2
+
+    inputType = None
+
+    if isinstance(micro_core_or_dict, MicroCore):
+        inputType = InputType.MICROCORE
+    elif isinstance(micro_core_or_dict, dict):
+        inputType = InputType.MICROCORE_DICT
+    else:
+        raise TypeError("Unsupported type for micro_core_or_dict")
 
     opentelemetry_wrapper = OpenTelemetryWrapper()
-    tracer = opentelemetry_wrapper.tracer
-    predictions_counter = opentelemetry_wrapper.create_counter(name="predict_endpoint_counter", description="Count of predictions made")
 
-    title = micro_core.name
-    if "micro_core" not in micro_core.name.lower():
-        title += " - micro_core"
 
     # TODO what about version?
-    app = FastAPI(title=title, description=micro_core.description)
+    app = FastAPI(title="MicroCore API service")
 
     patch_fastapi(app)
 
@@ -107,20 +133,6 @@ def create_api(micro_core: MicroCore) -> FastAPI:
         response_content = "OK"
         return response_content    
     
-    @app.post(
-        "/predict",
-        operation_id="predict",
-        response_model=micro_core.output_type,
-        # response_model_exclude_unset=True,
-        summary="performs prediction using the model",
-        status_code=status.HTTP_200_OK,
-    )
-    async def predict(input: micro_core.input_type) -> Any:  # type: ignore
-        with tracer.start_as_current_span("/predict") as predict_span:
-            predictions_counter.add(1)
-            """Executes this micro_core."""
-            return micro_core(input)
-
     @app.get(
         "/info",
         operation_id="info",
@@ -138,5 +150,15 @@ def create_api(micro_core: MicroCore) -> FastAPI:
     @app.get("/", include_in_schema=False)
     def root() -> Any:
         return RedirectResponse("./docs")
+    
+    if inputType == InputType.MICROCORE:
+
+        create_endpoint_route(opentelemetry_wrapper,app,"predict",micro_core_or_dict)
+
+    else:
+        
+        for endpoint_name,microcore_object in micro_core_or_dict:
+            create_endpoint_route(opentelemetry_wrapper,app,endpoint_name,microcore_object)
 
     return app
+
